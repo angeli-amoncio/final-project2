@@ -1,0 +1,225 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <algorithm>
+#include <random>
+#include <map>
+#include <mutex>
+#include <climits>
+
+using namespace std;
+
+#define PORT 9000
+#define MAX_PLAYERS 3
+#define NUM_ROUNDS 3
+#define CARDS_PER_PLAYER 5
+
+vector<int> client_sockets;
+vector<string> player_names;
+map<string, int> player_scores;
+mutex mtx;
+
+const vector<string> suits = {"Hearts", "Diamonds", "Clubs", "Spades"};
+
+struct Card {
+    int value;
+    string suit;
+    string face;
+};
+
+string card_face(int value) {
+    switch (value) {
+        case 1: return "Ace";
+        case 11: return "Jack";
+        case 12: return "Queen";
+        case 13: return "King";
+        default: return to_string(value);
+    }
+}
+
+Card draw_card() {
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> val_dis(1, 13);
+    uniform_int_distribution<> suit_dis(0, 3);
+    
+    Card card;
+    card.value = val_dis(gen);
+    card.suit = suits[suit_dis(gen)];
+    card.face = card_face(card.value);
+    return card;
+}
+
+void broadcast(string msg) {
+    for (int sock : client_sockets) {
+        send(sock, msg.c_str(), msg.length(), 0);
+    }
+}
+
+void send_to_player(int sock, string msg) {
+    send(sock, msg.c_str(), msg.length(), 0);
+}
+
+void handle_client(int client_sock) {
+    char buffer[1024] = {0};
+    int valread = read(client_sock, buffer, 1024);
+    buffer[valread] = '\0';
+    string name(buffer);
+
+    {
+        lock_guard<mutex> lock(mtx);
+        player_names.push_back(name);
+        client_sockets.push_back(client_sock);
+        player_scores[name] = 0;
+    }
+
+    string msg = name + " joined the game. (" + to_string(player_names.size()) + "/" + to_string(MAX_PLAYERS) + ")\n";
+    broadcast(msg);
+}
+
+void play_round(int round) {
+    broadcast("\n================ ROUND " + to_string(round) + " ================\n");
+    
+    // Deal cards to all players
+    map<string, vector<Card>> player_hands;
+    for (const auto& name : player_names) {
+        vector<Card> hand;
+        for (int i = 0; i < CARDS_PER_PLAYER; i++) {
+            hand.push_back(draw_card());
+        }
+        player_hands[name] = hand;
+    }
+
+    // Show each player their hand
+    for (size_t i = 0; i < player_names.size(); i++) {
+        string name = player_names[i];
+        int sock = client_sockets[i];
+        
+        string hand_msg = "\nYour hand:\n";
+        for (size_t j = 0; j < player_hands[name].size(); j++) {
+            const auto& card = player_hands[name][j];
+            hand_msg += to_string(j+1) + ". " + card.face + " of " + card.suit + "\n";
+        }
+        send_to_player(sock, hand_msg);
+    }
+
+    // Single turn per round - each player plays one card
+    broadcast("\n--- Playing Cards ---\n");
+    map<string, Card> played_cards;
+    
+    for (size_t i = 0; i < player_names.size(); i++) {
+        string name = player_names[i];
+        int sock = client_sockets[i];
+        
+        string prompt = "Select a card to play (1-" + to_string(player_hands[name].size()) + "): ";
+        send_to_player(sock, prompt);
+        
+        char buffer[1024] = {0};
+        int valread = read(sock, buffer, 1024);
+        buffer[valread] = '\0';
+        int card_index = stoi(string(buffer)) - 1;
+        
+        if (card_index >= 0 && card_index < player_hands[name].size()) {
+            Card played_card = player_hands[name][card_index];
+            played_cards[name] = played_card;
+            
+            string play_msg = name + " played: " + played_card.face + " of " + played_card.suit + "\n";
+            broadcast(play_msg);
+        }
+    }
+
+    // Determine round winner (lowest card value wins)
+    int min_value = INT_MAX;
+    vector<string> winners;
+    for (const auto& [name, card] : played_cards) {
+        if (card.value < min_value) {
+            min_value = card.value;
+            winners.clear();
+            winners.push_back(name);
+        } else if (card.value == min_value) {
+            winners.push_back(name);
+        }
+    }
+
+    // Update scores and announce winner
+    string win_msg;
+    if (winners.size() == 1) {
+        win_msg = "\nWinner of this round: " + winners[0] + " with " + 
+                 card_face(min_value) + " (lowest card)\n";
+        player_scores[winners[0]]++;
+    } else {
+        win_msg = "\nIt's a tie between: ";
+        for (auto& w : winners) {
+            win_msg += w + " ";
+            player_scores[w]++;
+        }
+        win_msg += "with " + card_face(min_value) + " (lowest card)\n";
+    }
+    broadcast(win_msg);
+}
+
+int main() {
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int opt = 1, addrlen = sizeof(address);
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
+    listen(server_fd, MAX_PLAYERS);
+    
+    cout << "==============================================" << endl;
+    cout << "=              TONG-ITS TAGISAN              =" << endl;
+    cout << "==============================================" << endl;
+    cout << "[Waiting for players...]" << endl;
+    
+    while (player_names.size() < MAX_PLAYERS) {
+        new_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+        thread(handle_client, new_socket).detach();
+        sleep(1);
+    }
+
+    broadcast("\n[All players connected. Starting game...]\n");
+
+    for (int round = 1; round <= NUM_ROUNDS; round++) {
+        play_round(round);
+    }
+
+    broadcast("\n================ FINAL SCORES ================\n");
+    int max_score = 0;
+    for (auto& [name, score] : player_scores) {
+        string msg = "[" + name + "] : " + to_string(score) + " point(s)\n";
+        broadcast(msg);
+        if (score > max_score) max_score = score;
+    }
+
+    vector<string> final_winners;
+    for (auto& [name, score] : player_scores) {
+        if (score == max_score) final_winners.push_back(name);
+    }
+
+    string final_msg = "\n🏆 Final Winner";
+    if (final_winners.size() == 1) {
+        final_msg += ": " + final_winners[0] + "\n";
+    } else {
+        final_msg += "s: ";
+        for (auto& name : final_winners) final_msg += name + " ";
+        final_msg += "\n";
+    }
+
+    broadcast(final_msg);
+    
+    // Close all client sockets
+    for (int sock : client_sockets) {
+        close(sock);
+    }
+    close(server_fd);
+    return 0;
+}
