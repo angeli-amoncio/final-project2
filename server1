@@ -1,0 +1,178 @@
+// tongits_server.cpp
+// Server for a 3-player, 3-round Tong-Its game
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <map>
+#include <algorithm>
+#include <random>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <mutex>
+
+using namespace std;
+
+#define PORT 9000
+#define MAX_PLAYERS 3
+#define NUM_ROUNDS 3
+
+struct Card {
+    string suit;
+    int value;
+
+    string to_string() const {
+        const vector<string> faces = {"", "A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"};
+        return faces[value] + " of " + suit;
+    }
+};
+
+struct Player {
+    int socket;
+    string name;
+    vector<Card> hand;
+};
+
+vector<string> suits = {"Hearts", "Diamonds", "Clubs", "Spades"};
+vector<Card> deck;
+vector<Card> discardPile;
+vector<Player> players;
+mutex mtx;
+
+void send_msg(int sock, const string& msg) {
+    send(sock, msg.c_str(), msg.size(), 0);
+}
+
+string receive_msg(int sock) {
+    char buf[1024] = {0};
+    int len = read(sock, buf, 1024);
+    if (len <= 0) return "";
+    return string(buf, len);
+}
+
+void broadcast(const string& msg) {
+    for (auto& p : players)
+        send_msg(p.socket, msg);
+}
+
+void init_deck() {
+    deck.clear();
+    for (string& suit : suits)
+        for (int v = 1; v <= 13; v++)
+            deck.push_back({suit, v});
+    shuffle(deck.begin(), deck.end(), default_random_engine(random_device{}()));
+}
+
+void deal_cards() {
+    init_deck();
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        players[i].hand.clear();
+        for (int j = 0; j < (i == 0 ? 13 : 12); j++) {
+            players[i].hand.push_back(deck.back());
+            deck.pop_back();
+        }
+    }
+    discardPile.clear();
+    discardPile.push_back(deck.back());
+    deck.pop_back();
+}
+
+void send_hand(Player& p) {
+    string msg = "\nYour hand:\n";
+    for (int i = 0; i < p.hand.size(); i++)
+        msg += to_string(i) + ": " + p.hand[i].to_string() + "\n";
+    send_msg(p.socket, msg);
+}
+
+void run_game() {
+    for (int round = 1; round <= NUM_ROUNDS; round++) {
+        broadcast("\n========= ROUND " + to_string(round) + " =========\n");
+        deal_cards();
+
+        for (int turn = 0; turn < MAX_PLAYERS; turn++) {
+            Player& current = players[turn];
+            send_msg(current.socket, "\nYour turn!\n");
+            send_hand(current);
+
+            // Ask where to draw from
+            send_msg(current.socket, "Draw from (1) Deck or (2) Discard?\n> ");
+            string choice = receive_msg(current.socket);
+
+            Card drawn;
+            if (choice[0] == '2' && !discardPile.empty()) {
+                drawn = discardPile.back();
+                discardPile.pop_back();
+            } else {
+                drawn = deck.back();
+                deck.pop_back();
+            }
+            current.hand.push_back(drawn);
+            send_msg(current.socket, "You drew: " + drawn.to_string() + "\n");
+            send_hand(current);
+
+            // Discard
+            send_msg(current.socket, "Choose a card index to discard:\n> ");
+            string discard_input = receive_msg(current.socket);
+            int discard_index = stoi(discard_input);
+            if (discard_index >= 0 && discard_index < current.hand.size()) {
+                discardPile.push_back(current.hand[discard_index]);
+                current.hand.erase(current.hand.begin() + discard_index);
+            }
+
+            broadcast("\n[" + current.name + "] made a move.\n");
+        }
+
+        // Score based on total card values
+        int lowest = 1e9;
+        string winner;
+        for (auto& p : players) {
+            int score = 0;
+            for (auto& c : p.hand) score += c.value;
+            if (score < lowest) {
+                lowest = score;
+                winner = p.name;
+            }
+        }
+        broadcast("\nWinner of Round " + to_string(round) + ": " + winner + "\n");
+    }
+
+    broadcast("\n=== GAME OVER ===\n");
+}
+
+void handle_client(int sock) {
+    string name = receive_msg(sock);
+    {
+        lock_guard<mutex> lock(mtx);
+        players.push_back({sock, name});
+        cout << "[+] Player connected: " << name << endl;
+    }
+}
+
+int main() {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    bind(server_fd, (sockaddr*)&address, sizeof(address));
+    listen(server_fd, MAX_PLAYERS);
+
+    cout << "[Server started on port " << PORT << "]\n";
+    cout << "Waiting for 3 players...\n";
+
+    while (players.size() < MAX_PLAYERS) {
+        int new_sock = accept(server_fd, nullptr, nullptr);
+        thread(handle_client, new_sock).detach();
+        sleep(1);
+    }
+
+    broadcast("All players connected! Starting game...\n");
+    run_game();
+    close(server_fd);
+    return 0;
+}
