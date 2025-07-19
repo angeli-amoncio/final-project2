@@ -1,0 +1,323 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <algorithm>
+#include <random>
+#include <map>
+#include <mutex>
+#include <climits>
+#include <sys/socket.h>
+#include <cerrno>
+#include <cstring>
+
+using namespace std;
+
+#define PORT 9000
+#define MAX_PLAYERS 3
+#define NUM_ROUNDS 3
+#define CARDS_PER_PLAYER 5
+
+vector<int> client_sockets;
+vector<string> player_names;
+map<string, int> player_scores;
+mutex mtx;
+
+const vector<string> suits = {"Hearts", "Diamonds", "Clubs", "Spades"};
+
+struct Card {
+    int value;
+    string suit;
+    string face;
+};
+
+string card_face(int value) {
+    switch (value) {
+        case 1: return "Ace";
+        case 11: return "Jack";
+        case 12: return "Queen";
+        case 13: return "King";
+        default: return to_string(value);
+    }
+}
+
+Card draw_card() {
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> val_dis(1, 13);
+    uniform_int_distribution<> suit_dis(0, 3);
+    
+    Card card;
+    card.value = val_dis(gen);
+    card.suit = suits[suit_dis(gen)];
+    card.face = card_face(card.value);
+    return card;
+}
+
+bool send_to_player(int sock, const string& msg) {
+    lock_guard<mutex> lock(mtx);
+    if (sock <= 0) return false;
+    ssize_t sent = send(sock, msg.c_str(), msg.length(), MSG_NOSIGNAL);
+    return sent > 0;
+}
+
+void broadcast(const string& msg) {
+    lock_guard<mutex> lock(mtx);
+    vector<int> disconnected;
+    
+    for (int sock : client_sockets) {
+        if (send(sock, msg.c_str(), msg.length(), MSG_NOSIGNAL) <= 0) {
+            disconnected.push_back(sock);
+        }
+    }
+    
+    // Remove disconnected clients
+    for (int sock : disconnected) {
+        auto it = find(client_sockets.begin(), client_sockets.end(), sock);
+        if (it != client_sockets.end()) {
+            close(sock);
+            client_sockets.erase(it);
+        }
+    }
+}
+
+void handle_client(int client_sock) {
+    char buffer[1024] = {0};
+    int valread = read(client_sock, buffer, 1024);
+    if (valread <= 0) {
+        close(client_sock);
+        return;
+    }
+    
+    buffer[valread] = '\0';
+    string name(buffer);
+
+    {
+        lock_guard<mutex> lock(mtx);
+        player_names.push_back(name);
+        client_sockets.push_back(client_sock);
+        player_scores[name] = 0;
+    }
+
+    string msg = name + " joined the game. (" + to_string(player_names.size()) + "/" + to_string(MAX_PLAYERS) + ")\n";
+    broadcast(msg);
+}
+
+void play_round(int round) {
+    broadcast("\n================ ROUND " + to_string(round) + " ================\n");
+    
+    // Deal cards to all players (hidden from others)
+    map<string, vector<Card>> player_hands;
+    vector<int> active_sockets;
+    vector<string> active_players;
+    
+    {
+        lock_guard<mutex> lock(mtx);
+        active_sockets = client_sockets;
+        active_players = player_names;
+    }
+    
+    for (size_t i = 0; i < active_players.size(); i++) {
+        string name = active_players[i];
+        int sock = active_sockets[i];
+        
+        vector<Card> hand;
+        for (int j = 0; j < CARDS_PER_PLAYER; j++) {
+            hand.push_back(draw_card());
+        }
+        player_hands[name] = hand;
+        
+        // Show player their own hand (private)
+        string hand_msg = "\nYour hand:\n";
+        for (size_t k = 0; k < hand.size(); k++) {
+            const auto& card = hand[k];
+            hand_msg += to_string(k+1) + ". " + card.face + " of " + card.suit + "\n";
+        }
+        if (!send_to_player(sock, hand_msg)) {
+            cerr << "Failed to send hand to player " << name << endl;
+            continue;
+        }
+    }
+
+    // Each player selects a card to play
+    map<string, Card> played_cards;
+    for (size_t i = 0; i < active_players.size(); i++) {
+        string name = active_players[i];
+        int sock = active_sockets[i];
+        
+        string prompt = "Select a card to play (1-" + to_string(CARDS_PER_PLAYER) + "): ";
+        if (!send_to_player(sock, prompt)) {
+            cerr << "Player " << name << " disconnected during card selection" << endl;
+            continue;
+        }
+        
+        char buffer[1024] = {0};
+        int valread = read(sock, buffer, 1024);
+        if (valread <= 0) {
+            cerr << "Player " << name << " disconnected" << endl;
+            continue;
+        }
+        
+        buffer[valread] = '\0';
+        try {
+            int card_index = stoi(string(buffer)) - 1;
+            if (card_index >= 0 && card_index < player_hands[name].size()) {
+                played_cards[name] = player_hands[name][card_index];
+            }
+        } catch (...) {
+            cerr << "Invalid input from player " << name << endl;
+        }
+    }
+
+    // Reveal all played cards after selections
+    broadcast("\nCards played this round:\n");
+    for (const auto& [name, card] : played_cards) {
+        string msg = name + " played: " + card.face + " of " + card.suit + "\n";
+        broadcast(msg);
+    }
+
+    // Determine round winner (lowest card value wins)
+    int min_value = INT_MAX;
+    vector<string> winners;
+    for (const auto& [name, card] : played_cards) {
+        if (card.value < min_value) {
+            min_value = card.value;
+            winners.clear();
+            winners.push_back(name);
+        } else if (card.value == min_value) {
+            winners.push_back(name);
+        }
+    }
+
+    // Update scores and announce winner
+    if (!winners.empty()) {
+        string win_msg;
+        if (winners.size() == 1) {
+            win_msg = "\nWinner of this round: " + winners[0] + " with " + 
+                     card_face(min_value) + " (lowest card)\n";
+        } else {
+            win_msg = "\nIt's a tie between: ";
+            for (auto& w : winners) {
+                win_msg += w + " ";
+            }
+            win_msg += "with " + card_face(min_value) + "\n";
+        }
+        
+        {
+            lock_guard<mutex> lock(mtx);
+            for (auto& w : winners) {
+                player_scores[w]++;
+            }
+        }
+        
+        broadcast(win_msg);
+    }
+}
+
+int main() {
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int opt = 1, addrlen = sizeof(address);
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, MAX_PLAYERS) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+    
+    cout << "==============================================" << endl;
+    cout << "=              TONG-ITS TAGISAN              =" << endl;
+    cout << "==============================================" << endl;
+    cout << "[Waiting for players...]" << endl;
+    
+    while (true) {
+        {
+            lock_guard<mutex> lock(mtx);
+            if (player_names.size() >= MAX_PLAYERS) break;
+        }
+        
+        new_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+        if (new_socket < 0) {
+            perror("accept");
+            continue;
+        }
+        
+        thread(handle_client, new_socket).detach();
+    }
+
+    broadcast("\n[All players connected. Starting game...]\n");
+
+    for (int round = 1; round <= NUM_ROUNDS; round++) {
+        {
+            lock_guard<mutex> lock(mtx);
+            if (client_sockets.empty()) {
+                cerr << "All players disconnected" << endl;
+                break;
+            }
+        }
+        play_round(round);
+    }
+
+    broadcast("\n================ FINAL SCORES ================\n");
+    int max_score = 0;
+    {
+        lock_guard<mutex> lock(mtx);
+        for (auto& [name, score] : player_scores) {
+            string msg = "[" + name + "] : " + to_string(score) + " point(s)\n";
+            broadcast(msg);
+            if (score > max_score) max_score = score;
+        }
+    }
+
+    vector<string> final_winners;
+    {
+        lock_guard<mutex> lock(mtx);
+        for (auto& [name, score] : player_scores) {
+            if (score == max_score) final_winners.push_back(name);
+        }
+    }
+
+    string final_msg = "\n🏆 Final Winner";
+    if (final_winners.size() == 1) {
+        final_msg += ": " + final_winners[0] + "\n";
+    } else {
+        final_msg += "s: ";
+        for (auto& name : final_winners) final_msg += name + " ";
+        final_msg += "\n";
+    }
+
+    broadcast(final_msg);
+    
+    // Close all client sockets
+    {
+        lock_guard<mutex> lock(mtx);
+        for (int sock : client_sockets) {
+            close(sock);
+        }
+        client_sockets.clear();
+    }
+    
+    close(server_fd);
+    return 0;
+}
